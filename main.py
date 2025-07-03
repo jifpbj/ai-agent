@@ -51,15 +51,14 @@ available_functions = types.Tool(
 
 # Map string function names to actual functions
 function_mapping = {
-"write_file": write_file,
-"run_python_file": run_python_file,
-"get_files_info": get_files_info,
-"get_file_content": get_file_content,
-
+    "write_file": write_file,
+    "run_python_file": run_python_file,
+    "get_files_info": get_files_info,
+    "get_file_content": get_file_content,
 }
 
 ## Calling Functions
-def call_function(function_call_part, verbose = False):
+def call_function(function_call_part, verbose=False):
     if verbose:
         print(f"Calling function: {function_call_part.name}({function_call_part.args})")
     else:
@@ -69,58 +68,101 @@ def call_function(function_call_part, verbose = False):
 
     function_to_call = function_mapping.get(function_name_str)
     try:
-        function_result = function_to_call( working_directory="./calculator/", **function_args)
+        # Assuming all functions in your mapping take working_directory
+        # Adjust if some functions don't need it.
+        function_result = function_to_call(working_directory="./calculator/", **function_args)
     except Exception as e:
         return types.Content(
             role="tool",
             parts=[
                 types.Part.from_function_response(
                     name=function_name_str,
-                    response={"error": f"Unknown function: {function_name_str}"},
+                    response={"error": f"Error executing {function_name_str}: {e}"},
                 )
             ],
         )
     return types.Content(
-    role="tool",
-    parts=[
-        types.Part.from_function_response(
-            name=function_name_str,
-            response={"result": function_result},
-        )
-    ],
-)
-
+        role="tool",
+        parts=[
+            types.Part.from_function_response(
+                name=function_name_str,
+                response={"result": function_result},
+            )
+        ],
+    )
 
 ## Message to send to the model ##
 model = "gemini-2.0-flash-001"
-user_prompt = args.content #get content from argparse cmd line
+user_prompt = args.content  # get content from argparse cmd line
 messages = [
     types.Content(role="user", parts=[types.Part(text=user_prompt)]),
 ]
 
+MAX_LOOP = 20  # Safeguard to prevent infinite loops
 
 ## Generate Content ##
-response = client.models.generate_content(
-    model=model,
-    contents=messages,
-    config = types.GenerateContentConfig(
-        tools=[available_functions],
-        system_instruction=system_prompt
-    )
-)
+def generate_content_loop(model_name, conversation_messages, system_instruction):
+    current_loop = 0
+    while current_loop < MAX_LOOP:
+        current_loop += 1
+        if args.verbose:
+            print(f"\n--- Loop {current_loop} ---")
+            print("Sending messages to model:")
+            for msg in conversation_messages:
+                print(f"  {msg.role}: {msg.parts[0].text if msg.parts and msg.parts[0].text else msg.parts[0].function_call.name if msg.parts and msg.parts[0].function_call else 'Function Response'}")
 
-if response.function_calls:
-    for function_call_part in response.function_calls:
-        function_call_result = call_function(function_call_part)
-        if function_call_result.parts[0].function_response.response:
-            print(f"Function {function_call_part.name} response: {function_call_result.parts[0].function_response.response}")
+        response = client.models.generate_content(
+            model=model_name,
+            contents=conversation_messages,
+            config=types.GenerateContentConfig(
+                tools=[available_functions],
+                system_instruction=system_instruction
+            )
+        )
+
+        if args.verbose:
+            metadata = response.usage_metadata
+            print("Prompt tokens:", metadata.prompt_token_count)
+            print("Response tokens:", metadata.candidates_token_count)
+            print("Model response received.")
+            if response.text:
+                print("Model text response:", response.text)
+            if response.function_calls:
+                print("Model requested function calls:")
+                for fc in response.function_calls:
+                    print(f"  - {fc.name}({fc.args})")
+
+        # Add the model's response to the conversation history
+        # If the model has a text response in its candidates, add that.
+        # Otherwise, if it has function calls, add those.
+        # It's important to add the model's *intent* to the history before executing functions.
+        for candidate in response.candidates:
+            if candidate.content:
+                conversation_messages.append(candidate.content)
+
+        ## Call functions if any are requested in the response ##
+        if response.function_calls:
+            for function_call_part in response.function_calls:
+                function_call_result = call_function(function_call_part, args.verbose)
+                if function_call_result.parts[0].function_response.response:
+                    if args.verbose:
+                        print(f"Function {function_call_part.name} response: {function_call_result.parts[0].function_response.response}")
+                    # Add the function's *result* to the conversation history
+                    conversation_messages.append(function_call_result)
+                else:
+                    raise Exception("No response from function call")
         else:
-            raise Exception("no response from function call")
-else:
-    print(response.text)
+            # If no function calls, the model has likely provided its final text response.
+            # Print the final text and break the loop.
+            if response.text:
+                print("\nFinal Model Response:")
+                print(response.text)
+            else:
+                print("\nModel did not provide a text response or function call in this turn.")
+            break # Exit the loop if no more function calls
 
-if args.verbose:
-    metadata = response.usage_metadata
-    print("User prompt:", args.content)
-    print("Prompt tokens:", metadata.prompt_token_count)
-    print("Response tokens:", metadata.candidates_token_count)
+    if current_loop >= MAX_LOOP:
+        print(f"\nWarning: Maximum loop limit ({MAX_LOOP}) reached. Conversation may be incomplete.")
+
+# Start the looped content generation
+generate_content_loop(model, messages, system_prompt)
